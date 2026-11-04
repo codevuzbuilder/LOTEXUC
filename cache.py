@@ -1,7 +1,5 @@
 """Xotiradagi kesh: sozlamalar, tugma/matn o'zgartirishlari, premium emoji xaritasi."""
 import re
-
-import db
 from defaults import SETTINGS
 
 UNSET = object()
