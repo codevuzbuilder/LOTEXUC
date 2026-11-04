@@ -1,0 +1,134 @@
+name: Bot 24/7
+
+on:
+  workflow_dispatch:            # qo'lda: Actions → Bot 24/7 → Run workflow
+  schedule:
+    - cron: "*/30 * * * *"      # har 30 daqiqada navbatga run qo'yadi (bot to'xtasa tiklaydi)
+
+# Bir vaqtda faqat BITTA bot ishlaydi. Yangi run joriysi tugashini kutadi (navbatda turadi).
+concurrency:
+  group: bot-runner
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355        # GitHub limiti 360 daqiqa
+
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+      DB_PATH: data/bot.db
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Sozlamalarni tekshirish
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "::error::BOT_TOKEN secret topilmadi (Settings → Secrets and variables → Actions)."
+            exit 1
+          fi
+          if [ -z "$ADMIN_IDS" ]; then
+            echo "::warning::ADMIN_IDS secret bo'sh — admin panelga hech kim kira olmaydi."
+          fi
+          resp=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe")
+          if echo "$resp" | grep -q '"ok":true'; then
+            echo "Token to'g'ri: $(echo "$resp" | grep -o '"username":"[^"]*"')"
+          else
+            echo "::error::Telegram tokenni qabul qilmadi (BOT_TOKEN noto'g'ri yoki bekor qilingan)."
+            exit 1
+          fi
+
+      - name: Kodni tekshirish
+        run: python -c "import main; print('Importlar joyida')"
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: botdata-${{ github.run_id }}
+          restore-keys: botdata-
+
+      - name: Botni ishga tushirish
+        run: |
+          python -u main.py > bot.log 2>&1 &
+          pid=$!
+
+          # 1) Bot haqiqatan ishga tushganini tasdiqlash (90 soniyagacha)
+          ok=0
+          for i in $(seq 1 90); do
+            if grep -q "Bot ishga tushdi" bot.log; then ok=1; break; fi
+            if ! kill -0 $pid 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Bot ishga tushmadi. Log:"
+            cat bot.log
+            kill $pid 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ Bot ishga tushdi"
+          tail -n +1 -f bot.log &
+          tailpid=$!
+
+          # 2) 5 soat 40 daqiqa kuzatish. Bot o'lsa — darhol xato bilan chiqish
+          end=$(( $(date +%s) + 20400 ))
+          while kill -0 $pid 2>/dev/null && [ "$(date +%s)" -lt "$end" ]; do
+            sleep 15
+          done
+
+          if kill -0 $pid 2>/dev/null; then
+            echo "Rejali qayta ishga tushish (vaqt tugadi)."
+            kill -TERM $pid
+            wait $pid 2>/dev/null || true
+            kill $tailpid 2>/dev/null || true
+            exit 0
+          else
+            kill $tailpid 2>/dev/null || true
+            echo "::error::Bot kutilmaganda to'xtadi (yuqoridagi log'ga qarang)."
+            exit 1
+          fi
+
+      - name: Bazani yopish
+        if: always()
+        run: |
+          if [ -f data/bot.db ]; then
+            python -c "import sqlite3; c=sqlite3.connect('data/bot.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" || true
+          fi
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data
+          key: botdata-${{ github.run_id }}
+
+      # Xato bo'lsa — adminga Telegram'da xabar
+      - name: Adminga xabar (xato bo'lsa)
+        if: failure()
+        continue-on-error: true
+        run: |
+          admin="${ADMIN_IDS%%,*}"
+          if [ -n "$admin" ] && [ -n "$BOT_TOKEN" ]; then
+            curl -s "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -d chat_id="$admin" \
+              --data-urlencode "text=⚠️ Bot workflow xato bilan to'xtadi. Loglar: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null
+          fi
+
+      # Navbatdagi sessiyani darhol boshlash (bo'lmasa — cron tiklaydi)
+      - name: Keyingi sessiya
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --ref ${{ github.ref_name }}
